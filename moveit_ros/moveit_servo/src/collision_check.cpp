@@ -56,6 +56,7 @@ CollisionCheck::CollisionCheck(const rclcpp::Node::SharedPtr& node, const ServoP
   , planning_scene_monitor_(planning_scene_monitor)
   , self_velocity_scale_coefficient_(-log(0.001) / parameters->self_collision_proximity_threshold)
   , scene_velocity_scale_coefficient_(-log(0.001) / parameters->scene_collision_proximity_threshold)
+  , check_collisions_(parameters->check_collisions)
   , period_(1. / parameters->collision_check_rate)
 {
   // Init collision request
@@ -75,6 +76,25 @@ CollisionCheck::CollisionCheck(const rclcpp::Node::SharedPtr& node, const ServoP
       node_->create_publisher<std_msgs::msg::Float64>("~/collision_velocity_scale", rclcpp::SystemDefaultsQoS());
 
   current_state_ = planning_scene_monitor_->getStateMonitor()->getCurrentState();
+
+  callback_handle_ = node_->add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter>& parameters) {
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+
+      for (const auto& param : parameters)
+      {
+        // Intercept changes matching your parameter path exactly
+        if (param.get_name() == "moveit_servo.check_collisions" || param.get_name() == "check_collisions")
+        {
+          this->check_collisions_ = param.as_bool();
+          
+          RCLCPP_INFO(node_->get_logger(), "Check_collision changed to: %s", 
+                      this->check_collisions_ ? "TRUE" : "FALSE");
+        }
+      }
+      return result;
+    });
 }
 
 void CollisionCheck::start()
@@ -89,55 +109,58 @@ void CollisionCheck::run()
     return;
   }
 
-  // Update to the latest current state
-  current_state_ = planning_scene_monitor_->getStateMonitor()->getCurrentState();
-  current_state_->updateCollisionBodyTransforms();
-  collision_detected_ = false;
-
-  // Do a timer-safe distance-based collision detection
-  collision_result_.clear();
-  auto locked_scene = planning_scene_monitor::LockedPlanningSceneRO(planning_scene_monitor_);
-  locked_scene->getCollisionEnv()->checkRobotCollision(collision_request_, collision_result_, *current_state_,
-                                                       locked_scene->getAllowedCollisionMatrix());
-  scene_collision_distance_ = collision_result_.distance;
-  collision_detected_ |= collision_result_.collision;
-  collision_result_.print();
-
-  collision_result_.clear();
-  // Self-collisions and scene collisions are checked separately so different thresholds can be used
-  locked_scene->getCollisionEnvUnpadded()->checkSelfCollision(collision_request_, collision_result_, *current_state_,
-                                                              locked_scene->getAllowedCollisionMatrix());
-  self_collision_distance_ = collision_result_.distance;
-  collision_detected_ |= collision_result_.collision;
-  collision_result_.print();
-
   velocity_scale_ = 1;
-  // If we're definitely in collision, stop immediately
-  if (collision_detected_)
+  if (check_collisions_)
   {
-    velocity_scale_ = 0;
-  }
-  else
-  {
-    // If we are far from a collision, velocity_scale should be 1.
-    // If we are very close to a collision, velocity_scale should be ~zero.
-    // When scene_collision_proximity_threshold is breached, start decelerating exponentially.
-    if (scene_collision_distance_ < parameters_->scene_collision_proximity_threshold)
-    {
-      // velocity_scale = e ^ k * (collision_distance - threshold)
-      // k = - ln(0.001) / collision_proximity_threshold
-      // velocity_scale should equal one when collision_distance is at collision_proximity_threshold.
-      // velocity_scale should equal 0.001 when collision_distance is at zero.
-      velocity_scale_ = std::min(velocity_scale_,
-                                 exp(scene_velocity_scale_coefficient_ *
-                                     (scene_collision_distance_ - parameters_->scene_collision_proximity_threshold)));
-    }
+    // Update to the latest current state
+    current_state_ = planning_scene_monitor_->getStateMonitor()->getCurrentState();
+    current_state_->updateCollisionBodyTransforms();
+    collision_detected_ = false;
 
-    if (self_collision_distance_ < parameters_->self_collision_proximity_threshold)
+    // Do a timer-safe distance-based collision detection
+    collision_result_.clear();
+    auto locked_scene = planning_scene_monitor::LockedPlanningSceneRO(planning_scene_monitor_);
+    locked_scene->getCollisionEnv()->checkRobotCollision(collision_request_, collision_result_, *current_state_,
+                                                        locked_scene->getAllowedCollisionMatrix());
+    scene_collision_distance_ = collision_result_.distance;
+    collision_detected_ |= collision_result_.collision;
+    collision_result_.print();
+
+    collision_result_.clear();
+    // Self-collisions and scene collisions are checked separately so different thresholds can be used
+    locked_scene->getCollisionEnvUnpadded()->checkSelfCollision(collision_request_, collision_result_, *current_state_,
+                                                                locked_scene->getAllowedCollisionMatrix());
+    self_collision_distance_ = collision_result_.distance;
+    collision_detected_ |= collision_result_.collision;
+    collision_result_.print();
+
+    // If we're definitely in collision, stop immediately
+    if (collision_detected_)
     {
-      velocity_scale_ =
-          std::min(velocity_scale_, exp(self_velocity_scale_coefficient_ *
-                                        (self_collision_distance_ - parameters_->self_collision_proximity_threshold)));
+      velocity_scale_ = 0;
+    }
+    else
+    {
+      // If we are far from a collision, velocity_scale should be 1.
+      // If we are very close to a collision, velocity_scale should be ~zero.
+      // When scene_collision_proximity_threshold is breached, start decelerating exponentially.
+      if (scene_collision_distance_ < parameters_->scene_collision_proximity_threshold)
+      {
+        // velocity_scale = e ^ k * (collision_distance - threshold)
+        // k = - ln(0.001) / collision_proximity_threshold
+        // velocity_scale should equal one when collision_distance is at collision_proximity_threshold.
+        // velocity_scale should equal 0.001 when collision_distance is at zero.
+        velocity_scale_ = std::min(velocity_scale_,
+                                  exp(scene_velocity_scale_coefficient_ *
+                                      (scene_collision_distance_ - parameters_->scene_collision_proximity_threshold)));
+      }
+
+      if (self_collision_distance_ < parameters_->self_collision_proximity_threshold)
+      {
+        velocity_scale_ =
+            std::min(velocity_scale_, exp(self_velocity_scale_coefficient_ *
+                                          (self_collision_distance_ - parameters_->self_collision_proximity_threshold)));
+      }
     }
   }
 

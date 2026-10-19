@@ -39,6 +39,7 @@
 #pragma once
 
 #include <mutex>
+#include <atomic>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -115,5 +116,8 @@ private:
 
   mutable std::mutex joint_state_mutex_;
   sensor_msgs::msg::JointState latest_joint_state_;
+
+  std::atomic<bool> check_collisions_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr callback_handle_;
 };
 }  // namespace moveit_servo
